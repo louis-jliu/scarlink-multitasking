@@ -112,7 +112,70 @@ write_hdf5_rna <- function(path, scrna, genes)
     return(NULL)
 }
 
-write_files <- function(archr_out, seurat_out, out_dir, window_size, ncores, scale){
+######################################################################## add multi-task functions
+get_task_ids = function(scrna.object, task_column){
+  id_list = list()
+  for (task in unique(scrna.object@meta.data[,task_column])){
+    id_list[[task]] = rownames(scrna.object@meta.data[scrna.object@meta.data[,task_column]==task,])
+  }
+  return(id_list)
+}
+
+split_write_hdf5_with_task <- function(dirname, selected.genes, tm.filtered,task_id_list)
+{
+  h5file <- tempfile(pattern="tmp_coassay_matrix", fileext=".h5", tmpdir=path.expand(dirname))
+  h5createFile(h5file)    
+  out <- lapply(selected.genes, function(x) write_hdf5_with_task(h5file, tm.filtered, x, task_id_list))
+  return(h5file)
+}
+
+write_hdf5_with_task <- function(path, tile.matrix, gene, task_id_list)
+{
+  path <- path.expand(path) # protect against tilde's.
+  
+  group <- gene
+  h5createGroup(path, group)
+  
+  cond <- rowData(tile.matrix)$symbol == gene
+  
+  tile_info_segment = as.data.frame(rowData(tile.matrix[cond, ]))
+  tile_info = as.data.frame(rowData(tile.matrix[cond, ]))
+  for (i in 1:length(task_id_list)){
+    tile_info = rbind(tile_info,tile_info_segment)
+  }
+  print('tile_info dim:')
+  print(dim(tile_info))
+  
+  h5write(tile_info, file=path, name=paste0(group, "/tile_info"))
+  
+  tm = tile.matrix[cond, ]@assays@data$TileMatrix
+  print('original tm dim:')
+  print(dim(tm))
+  tm_pr = tm
+  for (i in 1:length(task_id_list)){
+    cat('appending task:',i)
+    print(names(task_id_list)[i])
+    ids = task_id_list[[i]]
+    tm_temp = Matrix(0, dim(tm)[1],dim(tm)[2])
+    tm_temp@Dimnames = tm@Dimnames
+    tm_temp[,ids] = tm[,ids]
+    print(dim(tm_temp))
+    tm_pr = rbind(tm_pr,tm_temp)
+  }
+  print('tm_pr dim:')
+  print(dim(tm_pr))
+  # Saving matrix information.
+  h5write(tm_pr@x, file=path, name=paste0(group, "/data"))
+  h5write(dim(tm_pr), file=path, name=paste0(group, "/shape"))
+  h5write(tm_pr@i, file=path, name=paste0(group, "/indices")) # already zero-indexed.
+  h5write(tm_pr@p, file=path, name=paste0(group, "/indptr"))
+  
+  return(NULL)
+}
+
+
+#################################################################################################
+write_files <- function(archr_out, seurat_out, out_dir, window_size, ncores, scale, task_column=NA){
     ### Load Seurat and ArchR objects
     scatac.object <- loadArchRProject(archr_out)
     scrna.object <- readRDS(seurat_out)
@@ -145,7 +208,7 @@ write_files <- function(archr_out, seurat_out, out_dir, window_size, ncores, sca
 
     tm.filtered <- get_gene_tile_matrix(scatac.object, scrna.object, window_size=window_size)
     cell.info <- cbind(scrna.object@meta.data, as.data.frame(scatac.object@cellColData))
-    cell.info <- cell.info[!duplicated(as.list(cell.info))]
+    #cell.info <- cell.info[!duplicated(as.list(cell.info))]
     selected.genes <- unique(rowData(tm.filtered)$symbol)
 
     if(ncores > 1){
@@ -158,11 +221,22 @@ write_files <- function(archr_out, seurat_out, out_dir, window_size, ncores, sca
     # create chunks
     max_ix <- min(length(selected.genes), max(trunc(length(selected.genes)/50), 50))
     
-    tmp_files <- bplapply(1:max_ix, FUN = function(i) {
-    	   selected.genes.subset <- selected.genes[seq(i, length(selected.genes), max_ix)]
-    	   split_write_hdf5(out_dir, selected.genes.subset, tm.filtered[rowData(tm.filtered)$symbol %in% selected.genes.subset, ])
-           }, 
-           BPPARAM=bpparam) 
+    if(is.na(task_column)){
+      tmp_files <- bplapply(1:max_ix, FUN = function(i) {
+        selected.genes.subset <- selected.genes[seq(i, length(selected.genes), max_ix)]
+        split_write_hdf5(out_dir, selected.genes.subset, tm.filtered[rowData(tm.filtered)$symbol %in% selected.genes.subset, ])
+      }, 
+      BPPARAM=bpparam)
+    }else{
+      print('multi-task')
+      task_id_list = get_task_ids(scrna.object, task_column)
+      print(names(task_id_list))
+      tmp_files <- bplapply(1:max_ix, FUN = function(i) {
+        selected.genes.subset <- selected.genes[seq(i, length(selected.genes), max_ix)]
+        split_write_hdf5_with_task(out_dir, selected.genes.subset, tm.filtered[rowData(tm.filtered)$symbol %in% selected.genes.subset, ],task_id_list)
+      }, 
+      BPPARAM=bpparam)
+    }
     
     o <- h5closeAll()	    
 

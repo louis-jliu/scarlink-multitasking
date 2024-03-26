@@ -8,6 +8,7 @@ def main():
     parser.add_argument('--scatac', required=True, type=str, help="ArchR object of scATAC-seq data. The cell names must match the cell names in scRNA-seq object.")
     parser.add_argument('-o', '--outdir', required=True, type=str, help="Output directory. The same output directory must be used later to run scarlink and scarlink_tiles.")
     parser.add_argument('--window', required=False, type=int, help="Number of bases to consider beyond the gene body both upstream and downstream. Default is 250000.")
+    parser.add_argument('--task', required=False, type=str, help="task column name")
     parser.add_argument('-nc', '--ncores', required=False, type=int, help="Number of cores to parallelize the preprocessing step. Default is 5.")
     parser.add_argument('--scale', required=False, type=str, choices=['median', '10k'], help="scRNA-seq normalization scaling factor. Default is 10k")
     args = parser.parse_args()
@@ -40,8 +41,10 @@ def main():
         "scale": args.scale
     }
 
-
-    rfunc.write_files(archr_out, seurat_out, out_dir, args.window, args.ncores, args.scale)
+    if args.task is not None:
+        rfunc.write_files(archr_out, seurat_out, out_dir, args.window, args.ncores, args.scale, task_column=args.task)
+    else:
+        rfunc.write_files(archr_out, seurat_out, out_dir, args.window, args.ncores, args.scale)
 
     # write config file
     with open(out_dir + "config.ini", 'w') as conf:

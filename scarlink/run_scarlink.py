@@ -1,4 +1,5 @@
 import os
+import pandas as pd
 import logging
 import argparse
 from datetime import datetime
@@ -11,6 +12,7 @@ def main():
     parser.add_argument('-p', '--proc', required=False, type=int, help="Process id. This should be set to the job index when running in parallel on a cluster.")
     parser.add_argument('-np', '--nproc', required=False, type=int, help="Number of parallel jobs. Default value is 100 when -p is provided.")
     parser.add_argument('-c', '--celltype', required=False, type=str, help="Cell type column name. This column should be present in the Seurat/ArchR object provided in scarlink_processing.")
+    parser.add_argument('-t', '--task', required=False, type=str, help="Task column name, such as batch column. This column should be present cell_info.txt file in the outdir.")
     parser.add_argument('--sparsity', required=False, type=float, help="Maximum allowed sparsity in gene expression vector to run the regression model. Default is 0.9 meaning there can be at most 90 percent zeros in the gene expression vector.")
     args = parser.parse_args()
     dirname = args.outdir
@@ -31,6 +33,13 @@ def main():
         args.sparsity = 0.9
     
     celltype_col = args.celltype
+    task_col = args.task
+
+    if task_col is not None:
+        print('multitasking for: ', task_col)
+        cell_info = pd.read_csv(dirname+'/cell_info.txt',sep='\t')
+        n_task = cell_info[task_col].nunique()
+        print('Number of tasks: ', n_task)
 
     os.makedirs(log_dir, exist_ok = True)
     # create log file
@@ -46,8 +55,8 @@ def main():
         gene_names = [rm.gene_names[i] for i in range(p_ix, len(rm.gene_names), total_procs)]
 
     for gene in gene_names:
-        rm.train_test_model(gene, normalization_factor='ReadsInTSS',
-                            epochs=20, verbose=False, max_zero_fraction=args.sparsity) 
+        rm.train_test_model(gene, n_task=n_task, normalization_factor='ReadsInTSS',
+                            epochs=20, verbose=False, max_zero_fraction=args.sparsity)
 
     # computing Shapley values
     if celltype_col is not None:

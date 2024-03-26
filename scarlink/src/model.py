@@ -27,6 +27,32 @@ warnings.filterwarnings('ignore', category=NaturalNameWarning)
 matplotlib.rcParams['pdf.fonttype'] = 42
 matplotlib.rcParams['ps.fonttype'] = 42
 
+########################
+class MultiTaskL2Regularizer(tf.keras.regularizers.Regularizer):
+    def __init__(self, n_task, alpha=0.01):
+        self.n_task = n_task  # The index at which to split the weight vector
+        # print('regularizing with task number:', n_task)
+        self.alpha = alpha
+
+    def __call__(self, x):
+        # print('size of x:', x.shape)
+        partition_size = x.shape[0] // (self.n_task+1)
+        partitions = [x[i*partition_size:(i+1)*partition_size,:] for i in range(self.n_task+1)]
+
+        # Storing the first partition and the rest
+        w_0 = partitions[0]
+        w_t = partitions[1:]
+
+        reg1 = self.alpha * tf.reduce_sum(tf.square(w_0))
+        reg2 = 0
+        for partition in w_t:
+            reg2 += self.alpha * tf.reduce_sum(tf.square(partition))
+        
+        reg2 = reg2/self.n_task
+        
+        return reg1 + reg2
+#########################    
+
 class RegressionModel:
     """SCARlink regression model to predict gene expression from tile-based accessibility
     matrix using regularized Poisson regression.
@@ -98,7 +124,8 @@ class RegressionModel:
         self.train_ix, self.test_ix = get_train_test_split(self.input_file_handle, self.gex_matrix.shape[0], random_state = 9, group_cells = group_cells)
         # create scaler object
         self.scaler = MaxAbsScaler(copy = False)
-        self.alphas = [0, 0.000001, 0.00001, 0.0001, 0.001, 0.01, 0.1, 1, 5, 10, 20]
+        # self.alphas = [0, 0.000001, 0.00001, 0.0001, 0.001, 0.01, 0.1, 1, 5, 10, 20]
+        self.alphas = [0.00001, 0.0001,0.01, 0.1]
         # add path to GTF file
         self.gtf_file = gtf_file
         self.scatac_fragment_file = scatac_fragment_file
@@ -280,6 +307,8 @@ class RegressionModel:
         celltype_col : str
             The column in the cell_info data frame inside coassay_matrix.h5
             containing the cell groupings.
+        n_task : int
+            Number of tasks for multitasking.
 
         Returns
         -------
@@ -295,7 +324,7 @@ class RegressionModel:
         w = f['genes/' + gene][:]
         m_z = read_sparse_significance(f, k, 'z-score')
         m_p = read_sparse_significance(f, k, 'p-value')
-
+        
         df_z = pandas.DataFrame(m_z.todense(), columns=clusters)
         df_p = pandas.DataFrame(10**(-np.array(m_p.todense())), columns=clusters)
         tiles = self.input_file_handle.select(gene + '/tile_info')
@@ -408,7 +437,7 @@ class RegressionModel:
         f.close()
         return p_d 
 
-    def build_model(self, atac_shape, a):
+    def build_model(self, atac_shape, a, n_task=None):
         """Model framework for run regression.
         
         Parameters
@@ -417,6 +446,8 @@ class RegressionModel:
             Number of tiles in tile matrix.
         a : float
             Regularization parameter for L2-regularization.
+        n_task : int
+            Number of tasks for multitasking.
 
         Returns
         -------
@@ -425,7 +456,11 @@ class RegressionModel:
         """
         # regression framework
         inputs = tf.keras.layers.Input(shape=(atac_shape,), name = 'inputA')
-        out = tf.keras.layers.Dense(1, activation = tf.exp, name = 'rate', kernel_regularizer=tf.keras.regularizers.l2(a), kernel_constraint = tf.keras.constraints.NonNeg())(inputs)
+        if n_task is None:
+            out = tf.keras.layers.Dense(1, activation = tf.exp, name = 'rate', kernel_regularizer=tf.keras.regularizers.l2(a), kernel_constraint = tf.keras.constraints.NonNeg())(inputs)
+        else:
+            print('building model with task number:', n_task)
+            out = tf.keras.layers.Dense(1, activation = tf.exp, name = 'rate', kernel_regularizer=MultiTaskL2Regularizer(n_task, a), kernel_constraint = tf.keras.constraints.NonNeg())(inputs)
         m = tf.keras.models.Model(inputs=inputs, outputs=out)
         return m
 
@@ -450,7 +485,7 @@ class RegressionModel:
         return new_weights
 
     
-    def run_model_cross_validation(self, rna, atac, epochs, verbose, plot_loss):
+    def run_model_cross_validation(self, rna, atac, epochs, verbose, plot_loss, n_task=None):
         """Perform cross-validation of gene-level regression model.
 
         Parameters
@@ -465,6 +500,8 @@ class RegressionModel:
             Whether to print progress bar.
         plot_loss : bool
             Whether to plot train and test loss.
+        n_task : int
+            Number of tasks for multitasking.
 
         Returns
         -------
@@ -484,7 +521,7 @@ class RegressionModel:
 
         # print("Performing " + str(int(kfold)) + "-fold cross validation...")
         logging.info("Performing " + str(int(kfold)) + "-fold cross validation...")
-        if verbose: bar = progressbar.ProgressBar(max_value=len(self.alphas) * kfold)
+        # if verbose: bar = progressbar.ProgressBar(max_value=len(self.alphas) * kfold)
         counter = 0
         p_aix = -1
         for aix in range(len(self.alphas)):
@@ -500,7 +537,7 @@ class RegressionModel:
                 atac_train = atac[train_ix, :]
                 atac_test = atac[test_ix, :]
                 opt = tf.keras.optimizers.Adam(learning_rate=0.001, epsilon = 1)
-                model_custom = self.build_model(atac_train.shape[1], a)
+                model_custom = self.build_model(atac_train.shape[1], a, n_task)
                 model_custom.compile(optimizer=opt, loss='poisson')
                 hist = model_custom.fit(x=atac_train, y=rna_train, validation_data=(atac_test, rna_test), epochs=epochs, verbose=None)
                 if plot_loss: plot_hist(hist, "alpha: " + str(a)) 
@@ -536,7 +573,7 @@ class RegressionModel:
         if flag == 0: return None, None, None
         return s_best_corr, s_params, best_w
 
-    def test_model(self, rna, atac, w, a):
+    def test_model(self, rna, atac, n_task, w, a):
         """Compute Spearman correlation using the trained
         model on held-out test-set.
 
@@ -556,8 +593,10 @@ class RegressionModel:
         s_corr
             Spearman correlation.
         """
-
-        model_custom = self.build_model(atac.shape[1], a)
+        if n_task is not None:
+            model_custom = self.build_model(atac.shape[1], a, n_task)
+        else:
+            model_custom = self.build_model(atac.shape[1], a)
         model_custom.set_weights(w)
         s_corr, s_pval = self.find_correlation_spearman(model_custom, atac, rna)
         return s_corr
@@ -581,7 +620,7 @@ class RegressionModel:
         f.close()
         return cond
     
-    def train_test_model(self, gene, normalization_factor='ReadsInTSS', max_zero_fraction=0.9, epochs=20, verbose=True, plot_loss=False, force=False):
+    def train_test_model(self, gene, n_task=None, normalization_factor='ReadsInTSS', max_zero_fraction=0.9, epochs=20, verbose=True, plot_loss=False, force=False):
         """Perform cross validation for each regularization parameter
         and then choose the best model and test model performance on 
         held-out test set.
@@ -590,6 +629,8 @@ class RegressionModel:
         ----------
         gene : str
             Gene to run regression on.
+        n_task : int
+            number of tasks for multitasking.
         normalization_factor : str
             Normalization factor of tile matrix.
         max_zero_fraction : float
@@ -604,33 +645,45 @@ class RegressionModel:
             Not implemented. Whether to retrain the gene-model.
         """
 
-        # print("Training regression model on " + gene)
+        print("Training regression model on " + gene)
         logging.info("Training regression model on " + gene)
+        if n_task is not None:
+            print("Multitasking for " + str(n_task) + " tasks")
+            logging.info("Multitasking for " + str(n_task) + " tasks")
+
         if self.check_if_calculated(gene) and not force:
-            # print("Gene regression model for " + gene + " already calculated. Returning...")
+            print("Gene regression model for " + gene + " already calculated. Returning...")
             logging.info("Gene regression model for " + gene + " already calculated. Returning...")
             return
         gex_train, gex_test = self.get_gex_gene(gene)
         gex_train_sparsity = self.check_gex_sparsity(gex_train)
         if gex_train_sparsity > max_zero_fraction:
-            # print(gene + " expression too sparse with sparsity = " + str(gex_train_sparsity) + ". Maximum number of zeros allowed is " + str(max_zero_fraction) + ". Returning...")
+            print(gene + " expression too sparse with sparsity = " + str(gex_train_sparsity) + ". Maximum number of zeros allowed is " + str(max_zero_fraction) + ". Returning...")
             logging.info(gene + " expression too sparse with sparsity = " + str(gex_train_sparsity) + ". Maximum number of zeros allowed is " + str(max_zero_fraction) + ". Returning...")
             return
 
         tile_gene_mat_train, tile_gene_mat_test = self.gene_tile_matrix_scaled(gene, normalization_factor)
-        train_corr, train_alpha, train_w = self.run_model_cross_validation(np.ravel(gex_train.todense()), tile_gene_mat_train, epochs, verbose, plot_loss)
-        # print("Avg. cross-validation spearman correlation", train_corr)
-        # print("Chosen regularization parameter:", train_alpha) 
+        if n_task is not None:
+            print('Training model with task number:', n_task)
+            train_corr, train_alpha, train_w = self.run_model_cross_validation(np.ravel(gex_train.todense()), tile_gene_mat_train, epochs, verbose, plot_loss, n_task=n_task)
+        else:
+            train_corr, train_alpha, train_w = self.run_model_cross_validation(np.ravel(gex_train.todense()), tile_gene_mat_train, epochs, verbose, plot_loss)
+        print("Avg. cross-validation spearman correlation", train_corr)
+        print("Chosen regularization parameter:", train_alpha) 
         logging.info("Avg. cross-validation spearman correlation: " + str(train_corr))
         logging.info("Chosen regularization parameter: " + str(train_alpha))
         if train_corr is None:
             # print("ERROR: Regression could not be estimated. Returning...")
             logging.info("ERROR: Regression could not be estimated. Returning...")
             return
-        test_corr = self.test_model(np.ravel(gex_test.todense()), tile_gene_mat_test, train_w, train_alpha)
-        # print("Spearman corr on test set:", test_corr)
+        if n_task is not None:
+            print('Testing model with task number:', n_task)
+            test_corr = self.test_model(np.ravel(gex_test.todense()), tile_gene_mat_test, n_task, train_w, train_alpha)
+        else:
+            test_corr = self.test_model(np.ravel(gex_test.todense()), tile_gene_mat_test, None, train_w, train_alpha)
+        print("Spearman corr on test set:", test_corr)
         logging.info("Spearman corr on test set: " + str(test_corr))
-
+        print('Done training and testing for ' + gene)
         # write values
         f = h5py.File(self.output_dir + self.out_file, mode = 'a')
         if "genes/" + gene in f.keys(): del f["genes/" + gene]
